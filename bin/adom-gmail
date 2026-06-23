@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""adom-gmail — DEPRECATED shim. Superseded by `adom-google` (which generalises Gmail +
+Contacts + Drive/Calendar). This forwards old commands so nothing breaks; please switch to
+`adom-google gmail …`. Original preserved at
+gallia/skills/adom-google/adom-gmail.legacy.py.
+"""
+import sys, os, shutil
+
+TARGET = shutil.which("adom-google") or os.path.expanduser("~/.local/bin/adom-google")
+
+# Old adom-gmail subcommands → adom-google argv.
+MAP = {
+    "attachments": ["gmail", "attachments"],
+    "read":        ["gmail", "read"],
+    "ics":         ["gmail", "ics"],
+    "init":        ["init"],
+    "auth":        ["auth", "--manual"],   # adom-gmail used the desktop-client paste flow
+    "auth-code":   ["auth-code"],
+    "help":        ["help"],
+}
+
+
+def main():
+    if not os.path.exists(TARGET):
+        sys.exit("adom-gmail is deprecated and adom-google is not installed.\n"
+                 "Install it from the gallia 'adom-google' skill.")
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        args = ["help"]
+    cmd = args[0]
+    if cmd not in MAP:
+        sys.stderr.write(f"adom-gmail: unknown command '{cmd}'. Use `adom-google help`.\n")
+        sys.exit(2)
+    if cmd not in ("help",):
+        sys.stderr.write("[adom-gmail] deprecated → forwarding to "
+                         f"`adom-google {' '.join(MAP[cmd])}`. Switch when convenient.\n")
+    os.execv(TARGET, [TARGET] + MAP[cmd] + args[1:])
+
+
+if __name__ == "__main__":
+    main()

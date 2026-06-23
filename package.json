@@ -1,0 +1,58 @@
+{
+  "slug": "adom-google",
+  "version": "0.6.0",
+  "type": "app",
+  "license": "MIT",
+  "description": "Drive your whole Google Workspace from the terminal — Gmail, Contacts, Drive, Sheets, Docs, Slides, Calendar, Tasks, Google Chat, plus a generic `api` passthrough to hit ANY Google API. Open source, ships with NO OAuth provider baked in: point it at your own token-broker gateway (`provider set`), buy a managed one, or — Adom staff — install the private adom-google-adom provider. One-click OAuth, no client secret on your machine. First run asks safe mode (no delete) vs full mode (incl. delete).",
+  "keywords": [
+    "adom-google",
+    "google-workspace",
+    "oauth",
+    "gmail",
+    "google-sheets",
+    "google-docs",
+    "google-slides",
+    "google-calendar",
+    "google-chat",
+    "cli",
+    "ai-agent"
+  ],
+  "tags": [
+    "google-workspace",
+    "oauth",
+    "gmail",
+    "cli",
+    "ai-agent",
+    "open-source",
+    "mit"
+  ],
+  "install": {
+    "binary_name": "adom-google"
+  },
+  "dependencies": {},
+  "scripts": {
+    "install": "./install.sh",
+    "uninstall": "./uninstall.sh"
+  },
+  "files": [
+    "bin/adom-google",
+    "bin/adom-gmail",
+    "skills/adom-google/SKILL.md",
+    "skills/adom-google-onboarding/SKILL.md",
+    "README.md",
+    "LICENSE",
+    "MIGRATION.md",
+    "provider.example.json",
+    "docs/hero.png",
+    "docs/enable-apis.png",
+    "docs/chat-reads-email.png",
+    "docs/onboard-1-plan.png",
+    "docs/onboard-2-enable-apis.png",
+    "docs/onboard-3-redirect-uri.png",
+    "docs/onboard-4-authorized.png",
+    "screenshots/hero.png",
+    "install.sh",
+    "uninstall.sh",
+    "package.json"
+  ]
+}

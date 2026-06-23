@@ -1,0 +1,6 @@
+{
+  "_comment": "adom-google ships with NO provider. To self-host, copy this to ~/.config/adom-google/provider.json (or run `adom-google provider set`). It points the CLI at YOUR OAuth gateway + Google client. No client secret goes here — in broker mode the secret lives only on the gateway.",
+  "gateway_url": "https://your-oauth-gateway.example.com",
+  "client_id": "YOUR_GOOGLE_OAUTH_CLIENT_ID.apps.googleusercontent.com",
+  "app": "adom-google"
+}

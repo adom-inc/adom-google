@@ -1,0 +1,5 @@
+# local OAuth state never belongs in the repo
+config.json
+provider.json
+__pycache__/
+*.pyc

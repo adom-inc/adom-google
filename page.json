@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "type": "app",
+  "slug": "adom-google",
+  "title": "adom-google",
+  "brief": "Drive your whole Google Workspace from the terminal — Gmail, Drive, Sheets, Docs, Slides, Calendar, Tasks, Chat + any Google API.",
+  "version": "0.6.0",
+  "visibility": "public",
+  "install": {
+    "binary_name": "adom-google",
+    "install_dir": "",
+    "install_hint": "",
+    "version_cmd": ""
+  },
+  "author": {
+    "id": "6738b00a4dc87b8adbb0a5a3",
+    "name": "John Lauer",
+    "email": "john@adom.inc"
+  },
+  "tags": [
+    "google-workspace",
+    "oauth",
+    "gmail",
+    "cli",
+    "ai-agent",
+    "open-source",
+    "mit"
+  ],
+  "license": "MIT",
+  "hero": {
+    "path": "docs/hero.png",
+    "type": "image"
+  },
+  "sample_prompts": [],
+  "discovery_triggers": [],
+  "discovery_pitch": null,
+  "metadata": {
+    "hero_path": "docs/hero.png",
+    "hero_type": "image"
+  },
+  "created_at": "2026-06-16T22:28:58.933Z",
+  "updated_at": "2026-06-17T00:57:47.322Z",
+  "skills": [],
+  "hero_path": "docs/hero.png",
+  "hero_type": "image"
+}

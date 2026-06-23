@@ -1,0 +1,1189 @@
+#!/usr/bin/env python3
+"""adom-google — programmatic access to a user's Google Workspace from an Adom container.
+
+Layered, REST-direct CLI (no browser automation, no heavyweight base CLI):
+
+  ┌─ adom OAuth layer ── one shared Adom OAuth client + OAuth Gateway redirect →
+  │                      a long-lived refresh token stored 0600 per user
+  ├─ adom-google ─────── thin, modular wrapper exposing: gmail / contacts /
+  │                      (drive, calendar trivially addable — same token plumbing)
+  └─ base ────────────── the Google REST APIs themselves, called directly
+
+Generalises (and replaces) the old `adom-gmail`, which was gmail.readonly-only.
+The gmail subcommands here are behaviour-compatible with adom-gmail, and the old
+~/.config/adom-gmail/config.json is auto-imported on first run.
+
+Auth (one consent, long-lived refresh token):
+  adom-google auth            # Adom way — uses the OAuth Gateway (no localhost loopback)
+  adom-google auth --manual   # fallback — desktop-client paste flow (like adom-gmail)
+  adom-google auth-code '<code>'   # finish the --manual flow
+  adom-google status          # show what's authorised (never prints secrets)
+
+See `adom-google help`.
+"""
+import sys, os, json, base64, argparse, urllib.parse, ssl, socket, hashlib, secrets, struct, time
+import requests
+
+CFG_DIR = os.path.expanduser("~/.config/adom-google")
+CFG = os.path.join(CFG_DIR, "config.json")
+LEGACY_CFG = os.path.expanduser("~/.config/adom-gmail/config.json")
+HERE = os.path.dirname(os.path.realpath(__file__))  # realpath: resolve the ~/.local/bin symlink
+
+# Scopes adom-google requests. Adding drive/calendar later = add one line here and
+# re-run `adom-google auth`; everything else (token refresh, API calls) is generic.
+# Two scope PROFILES. The consent screen's wording is driven entirely by these.
+#   SAFE (default): no "see/delete ALL your files/sheets/calendars" lines. Uses narrowed
+#     scopes — drive.file (only files this app creates/opens), calendar.events, gmail.modify
+#     (NO permanent delete). Can create+edit Sheets/Docs/Slides it makes (via drive.file)
+#     without the broad spreadsheets/documents/presentations "delete all" scopes.
+#   FULL (opt-in, `auth --full`): the broad set — can touch ALL of the user's existing
+#     Drive/Sheets/Docs/Slides/Calendars. For trusted users who want the whole board.
+SCOPES_SAFE = [
+    "https://www.googleapis.com/auth/gmail.modify",        # Gmail read/compose/send/labels (NOT permanent-delete)
+    "https://www.googleapis.com/auth/contacts",            # People API — contacts read+write
+    "https://www.googleapis.com/auth/drive.file",          # only files THIS app creates/opens (not "all your files")
+    "https://www.googleapis.com/auth/calendar.events",     # calendar EVENTS (not "delete all your calendars")
+    "https://www.googleapis.com/auth/tasks",               # Tasks
+    "https://www.googleapis.com/auth/chat.messages",       # Google Chat — read + post (not a "delete all" risk)
+    "https://www.googleapis.com/auth/chat.spaces.readonly", # Google Chat — list your spaces
+]
+SCOPES_FULL = [
+    "https://www.googleapis.com/auth/gmail.modify",        # Gmail read/compose/send/labels
+    "https://www.googleapis.com/auth/contacts",            # contacts read+write
+    "https://www.googleapis.com/auth/drive",               # ALL Drive files, sharing, permissions
+    "https://www.googleapis.com/auth/spreadsheets",        # ALL Sheets — read+edit
+    "https://www.googleapis.com/auth/documents",           # ALL Docs — read+edit
+    "https://www.googleapis.com/auth/presentations",       # ALL Slides — read+edit
+    "https://www.googleapis.com/auth/calendar",            # full Calendar
+    "https://www.googleapis.com/auth/tasks",               # Tasks
+    "https://www.googleapis.com/auth/chat.messages",       # Google Chat — read + POST messages as you (user OAuth)
+    "https://www.googleapis.com/auth/chat.spaces.readonly", # Google Chat — list the spaces you're in
+    # (Chat works because the shared rock-verbena project has a configured Chat app.)
+    # Admin/Directory scopes stay OUT — separate admin-only opt-in.
+]
+
+
+def _scopes_for(mode):
+    return SCOPES_FULL if mode == "full" else SCOPES_SAFE
+
+
+# ---------------------------------------------------------------- org onboarding
+# Adom's shared OAuth gateway. Its /callback is a PUBLIC, MULTI-TENANT relay: any org can
+# register a one-time `state` over the WebSocket and have its auth code relayed back — zero
+# per-org config on the gateway, near-zero load (a callback is one tiny request). A new org
+# points its OWN Google OAuth client's redirect_uri at this callback and keeps its OWN client
+# secret on its OWN container (RELAY mode, broker:false) — Adom never sees the org's secret.
+# (Adom employees use BROKER mode instead, where the secret lives on the gateway; see provider.)
+ADOM_SHARED_GATEWAY = "https://oauth-9mycwxij7tif.adom.cloud"
+
+# The nine Google APIs adom-google drives — (console "enable" id, human label).
+ONBOARD_APIS = [
+    ("gmail.googleapis.com",         "Gmail API"),
+    ("people.googleapis.com",        "People API (Contacts)"),
+    ("drive.googleapis.com",         "Google Drive API"),
+    ("sheets.googleapis.com",        "Google Sheets API"),
+    ("docs.googleapis.com",          "Google Docs API"),
+    ("slides.googleapis.com",        "Google Slides API"),
+    ("calendar-json.googleapis.com", "Google Calendar API"),
+    ("tasks.googleapis.com",         "Google Tasks API"),
+    ("chat.googleapis.com",          "Google Chat API"),
+]
+
+def _enable_apis_url(project=None):
+    # One URL that enables ALL nine APIs in one click (the GCP "enable multiple APIs" flow).
+    u = "https://console.cloud.google.com/flows/enableapi?apiid=" + ",".join(a for a, _ in ONBOARD_APIS)
+    return u + ("&project=" + project if project else "")
+
+def _onboard_config(org=None):
+    """The exact, canonical values an org needs to wire up their own Google OAuth client.
+    Consumed by the onboarding skill (via `onboard --json`) to auto-fill the Cloud Console."""
+    gw = (_provider().get("gateway_url") or ADOM_SHARED_GATEWAY).rstrip("/")
+    label = "Adom Workspace CLI" + (f" — {org}" if org else "")
+    return {
+        "org": org,
+        "gateway_url": gw,
+        "redirect_uri": gw + "/callback",          # paste verbatim into the OAuth client
+        "javascript_origins": [],                   # none needed (no browser JS client)
+        "enable_apis_url": _enable_apis_url(),
+        "apis": [{"id": a, "label": l} for a, l in ONBOARD_APIS],
+        "scopes_safe": SCOPES_SAFE,
+        "scopes_full": SCOPES_FULL,
+        "consent": {                                # OAuth consent screen settings
+            "user_type": "Internal",               # Internal → only the org's Workspace, long-lived tokens
+            "app_name": label,
+            "client_type": "Web application",       # the OAuth client TYPE to create
+            "client_name": label,
+        },
+        "console": {                                # deep links the skill drives the browser to
+            "home":           "https://console.cloud.google.com/",
+            "project_create": "https://console.cloud.google.com/projectcreate",
+            "consent_screen": "https://console.cloud.google.com/auth/overview",
+            "credentials":    "https://console.cloud.google.com/apis/credentials",
+            "create_client":  "https://console.cloud.google.com/apis/credentials/oauthclient",
+            "chat_config":    "https://console.cloud.google.com/apis/api/chat.googleapis.com/hangouts-chat",
+        },
+    }
+
+ONBOARD_HINT = """Hint: ORG ONBOARDING — drive the user's OWN browser through Google Cloud Console.
+Hint: This is the hand-held setup that gives a brand-new org their own Google OAuth client so
+Hint: adom-google works for their whole team. Use the `adom-google-onboarding` skill, which
+Hint: drives the user's REAL logged-in browser (adom-desktop `nbrowser_*`; pup native-mode as
+Hint: fallback) and AUTO-FILLS the Cloud Console fields. Get the exact values to type with:
+Hint:     adom-google onboard --json        # redirect_uri, the 9 APIs, scopes, consent settings
+Hint: Steps the skill performs (screenshotting + pausing for the user's approval clicks):
+Hint:   1. Create/select a Google Cloud project.
+Hint:   2. Enable all nine APIs in one click (the `enable_apis_url`).
+Hint:   3. Configure the OAuth consent screen (User type = Internal; app name from config).
+Hint:   4. Create an OAuth client (type = Web application); AUTO-FILL Authorized redirect URI
+Hint:      with the gateway `redirect_uri` (the error-prone field — never make the user type it).
+Hint:   5. Capture the client_id + client_secret from the final dialog.
+Hint:   6. Save them:   adom-google onboard finish --org <slug> --client-id <id> --client-secret <secret>
+Hint:   7. Ask the user safe vs full mode, then:   adom-google auth
+Hint: The secret stays on THE USER'S container (0600) and rides Adom's shared callback in RELAY
+Hint: mode — Adom never holds it."""
+
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+PEOPLE_API = "https://people.googleapis.com/v1"
+
+# --- OAuth PROVIDER (gateway URL + client) — deliberately NOT hardcoded -----------------------
+# This open-source CLI ships with ZERO provider baked in. The provider (which OAuth gateway to
+# talk to + which Google client_id) is resolved at runtime so the public code carries no
+# Adom-specific infrastructure. Resolution, later wins:
+#   1. bundled provider.json next to the script  (a private *provider* package may ship this)
+#   2. legacy credentials.json next to the script (old {clientId,...}; back-compat only)
+#   3. ~/.config/adom-google/provider.json        (what `provider set` / the employee pkg writes)
+#   4. env: OAUTH_GATEWAY_URL, OAUTH_GATEWAY_WS, ADOM_GOOGLE_CLIENT_ID/SECRET/APP
+# Adom employees get the Adom provider via the private `adom-google-adom` package; everyone else
+# self-hosts a gateway or buys a managed one (support@adom.inc). See README.
+DEFAULT_APP = "adom-google"
+PROVIDER_PATH = os.path.join(CFG_DIR, "provider.json")
+BUNDLED_PROVIDER = os.path.join(HERE, "provider.json")
+LEGACY_CREDS = os.path.join(HERE, "credentials.json")
+MANUAL_REDIRECT = "http://localhost"  # manual desktop-client flow: loopback, user copies the code
+
+_PROVIDER = None
+def _provider():
+    """Resolve {app, gateway_url, gateway_ws, gateway_redirect, client_id, client_secret}."""
+    global _PROVIDER
+    if _PROVIDER is not None:
+        return _PROVIDER
+    p = {"app": DEFAULT_APP, "gateway_url": None, "gateway_ws": None,
+         "client_id": None, "client_secret": None, "broker": None}
+    def merge(path, keymap):
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                d = json.load(f)
+        except Exception:
+            return
+        for src, dst in keymap.items():
+            if d.get(src):
+                p[dst] = d[src]
+    full = {"gateway_url": "gateway_url", "gateway_ws": "gateway_ws", "client_id": "client_id",
+            "client_secret": "client_secret", "app": "app"}
+    merge(BUNDLED_PROVIDER, full)
+    merge(LEGACY_CREDS, {"clientId": "client_id", "clientSecret": "client_secret", "app": "app"})
+    merge(PROVIDER_PATH, full)
+    e = os.environ
+    p["gateway_url"]    = e.get("OAUTH_GATEWAY_URL",      p["gateway_url"])
+    p["gateway_ws"]     = e.get("OAUTH_GATEWAY_WS",       p["gateway_ws"])
+    p["client_id"]      = e.get("ADOM_GOOGLE_CLIENT_ID",  p["client_id"])
+    p["client_secret"]  = e.get("ADOM_GOOGLE_CLIENT_SECRET", p["client_secret"])
+    p["app"]            = e.get("ADOM_GOOGLE_APP",        p["app"])
+    # broker is a bool — merge() skips falsy values, so read it explicitly (later wins).
+    for path in (BUNDLED_PROVIDER, PROVIDER_PATH):
+        if os.path.exists(path):
+            try:
+                d = json.load(open(path))
+                if "broker" in d:
+                    p["broker"] = bool(d["broker"])
+            except Exception:
+                pass
+    if "ADOM_GOOGLE_BROKER" in e:
+        p["broker"] = e["ADOM_GOOGLE_BROKER"].strip().lower() in ("1", "true", "yes", "on")
+    if p["gateway_url"]:
+        p["gateway_url"] = p["gateway_url"].rstrip("/")
+        p["gateway_ws"] = (p["gateway_ws"] or "wss://" + p["gateway_url"].split("://", 1)[-1]).rstrip("/")
+        p["gateway_redirect"] = p["gateway_url"] + "/callback"
+    else:
+        p["gateway_redirect"] = None
+    _PROVIDER = p
+    return p
+
+
+NO_PROVIDER_HINT = """ERROR: adom-google has no OAuth provider configured (gateway URL + client_id).
+The open-source CLI ships without one on purpose — the provider is account-specific. Three ways:
+Hint:   • Adom employee  → install the private `adom-google-adom` package (drops the Adom provider).
+Hint:   • Managed (any org, ~$5/mo) → email support@adom.inc for a hosted OAuth gateway container.
+Hint:   • Self-host (DIY) → run your own gateway (john/service-oauth) + Google OAuth client, then:
+Hint:         adom-google provider set --gateway https://your-gateway.example --client-id <id>
+Hint: Check the current provider any time with: adom-google provider show"""
+
+# AI hint emitted whenever adom-google is unconfigured. Per ai-hints-in-clis: this is how the
+# CLI forces the installing AI to ASK THE USER the safe/full choice at the moment of setup,
+# instead of silently picking. Read at the moment of need — survives context compaction.
+SETUP_HINT = """ERROR: adom-google is not authorized yet (no Google token for this container).
+Hint: BEFORE running auth, ASK THE USER which access mode they want — do NOT choose for them.
+Hint: Present it as a clear question (use AskUserQuestion). The two modes:
+Hint:   • safe  (recommended default) — read/write Gmail, Contacts, Calendar events, Tasks, and
+Hint:           ONLY the Drive/Sheets/Docs/Slides files THIS app creates. The consent screen shows
+Hint:           NO "see & delete ALL your files/spreadsheets/calendars" — nothing scary.
+Hint:   • full  — broad read/write/DELETE across ALL the user's existing Drive/Sheets/Docs/Slides/
+Hint:           Calendars. Only for users who explicitly want full control incl. delete.
+Hint: After the user picks, run EXACTLY ONE of:
+Hint:     adom-google auth          # safe mode
+Hint:     adom-google auth --full   # full mode (includes delete)
+Hint: The auth command prints a consent URL — open it in the user's browser; they click Allow once."""
+
+
+# ---------------------------------------------------------------- config / creds
+def _load():
+    cfg = _maybe_load_raw()
+    if cfg is None:
+        sys.exit(SETUP_HINT)
+    if not cfg.get("refresh_token"):
+        sys.exit(SETUP_HINT)
+    return cfg
+
+
+def _maybe_load_raw():
+    if os.path.exists(CFG):
+        with open(CFG) as f:
+            return json.load(f)
+    # One-time migration from adom-gmail.
+    if os.path.exists(LEGACY_CFG):
+        with open(LEGACY_CFG) as f:
+            legacy = json.load(f)
+        legacy.setdefault("scopes", ["https://www.googleapis.com/auth/gmail.readonly"])
+        legacy["_migrated_from"] = LEGACY_CFG
+        _save(legacy)
+        sys.stderr.write(f"[adom-google] imported credentials from {LEGACY_CFG} "
+                         f"(gmail.readonly only — run `adom-google auth` to add contacts).\n")
+        return legacy
+    return None
+
+
+def _save(cfg):
+    os.makedirs(CFG_DIR, exist_ok=True)
+    fd = os.open(CFG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(CFG, 0o600)
+
+
+def _client_creds(cfg):
+    """client_id (public) + client_secret, from the per-user config or the resolved provider.
+    In BROKER mode the secret is None — it lives only on the gateway; the manual/local flow
+    still uses a real secret (via `init` or a self-host provider)."""
+    pr = _provider()
+    cid = cfg.get("client_id") or pr["client_id"]
+    csec = cfg.get("client_secret") or pr.get("client_secret")
+    if not cid:
+        sys.exit(NO_PROVIDER_HINT)
+    return cid, csec
+
+
+# ---------------------------------------------------------------- token / API
+def _access_token(cfg):
+    # Reuse a cached access token while it's still valid.
+    if cfg.get("access_token") and cfg.get("access_expires", 0) > time.time():
+        return cfg["access_token"]
+    if cfg.get("broker"):
+        # Confidential-client broker: the gateway holds the secret and does the refresh.
+        pr = _provider()
+        if not pr["gateway_url"]:
+            sys.exit(NO_PROVIDER_HINT)
+        r = requests.post(pr["gateway_url"] + "/refresh",
+                          json={"app": cfg.get("app", pr["app"]), "refresh_token": cfg["refresh_token"]},
+                          timeout=30)
+        if r.status_code != 200:
+            sys.exit(f"Gateway token refresh failed ({r.status_code}). Re-run `adom-google auth`.")
+        j = r.json()
+    else:
+        cid, csec = _client_creds(cfg)
+        if not csec:
+            sys.exit("No client secret for local refresh. Re-run `adom-google auth` (uses the broker).")
+        r = requests.post(TOKEN_URL, data={
+            "client_id": cid, "client_secret": csec,
+            "refresh_token": cfg["refresh_token"], "grant_type": "refresh_token",
+        }, timeout=30)
+        if r.status_code != 200:
+            sys.exit(f"Token refresh failed ({r.status_code}). Re-run `adom-google auth`.")
+        j = r.json()
+    cfg["access_token"] = j["access_token"]
+    cfg["access_expires"] = time.time() + int(j.get("expires_in", 3600)) - 60
+    _save(cfg)
+    return cfg["access_token"]
+
+
+def _request(cfg, method, url, **kw):
+    tok = _access_token(cfg)
+    headers = kw.pop("headers", {})
+    headers["Authorization"] = f"Bearer {tok}"
+    r = requests.request(method, url, headers=headers, timeout=30, **kw)
+    if r.status_code == 403 and "people.googleapis.com" in url:
+        sys.exit(f"403 from People API ({r.status_code}). The stored token likely lacks the "
+                 f"contacts scope — run `adom-google auth` to re-consent with the full scope set.")
+    if r.status_code >= 400:
+        sys.exit(f"Google API error ({r.status_code}) {method} {url}:\n{r.text}")
+    return r.json() if r.content else {}
+
+
+def _gmail(cfg, path):
+    return _request(cfg, "GET", f"{GMAIL_API}/{path}")
+
+
+def _has_scope(cfg, scope):
+    return scope in (cfg.get("scopes") or [])
+
+
+# ---------------------------------------------------------------- gmail (migrated)
+def _walk_parts(part, out):
+    body = part.get("body", {})
+    if body.get("attachmentId"):
+        out.append({
+            "attachmentId": body["attachmentId"],
+            "filename": part.get("filename", ""),
+            "mimeType": part.get("mimeType", ""),
+            "size": body.get("size", 0),
+        })
+    for p in part.get("parts", []):
+        _walk_parts(p, out)
+
+
+def _list_attachments(cfg, msg_id):
+    msg = _gmail(cfg, f"messages/{msg_id}")
+    out = []
+    _walk_parts(msg.get("payload", {}), out)
+    return out
+
+
+def _fetch_attachment_bytes(cfg, msg_id, att_id):
+    data = _gmail(cfg, f"messages/{msg_id}/attachments/{att_id}")["data"]
+    return base64.urlsafe_b64decode(data + "===")
+
+
+def _unfold(text):
+    lines, cur = [], ""
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        if raw[:1] in (" ", "\t"):
+            cur += raw[1:]
+        else:
+            if cur:
+                lines.append(cur)
+            cur = raw
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _fmt_dt(val):
+    v = val.strip()
+    try:
+        if v.endswith("Z"):
+            return f"{v[0:4]}-{v[4:6]}-{v[6:8]} {v[9:11]}:{v[11:13]} UTC"
+        if "T" in v and len(v) >= 15:
+            return f"{v[0:4]}-{v[4:6]}-{v[6:8]} {v[9:11]}:{v[11:13]}"
+        if len(v) == 8:
+            return f"{v[0:4]}-{v[4:6]}-{v[6:8]} (all day)"
+    except Exception:
+        pass
+    return v
+
+
+def parse_ics(raw):
+    text = raw.decode("utf-8", "replace")
+    events, ev = [], None
+    for line in _unfold(text):
+        if line.startswith("BEGIN:VEVENT"):
+            ev = {}
+        elif line.startswith("END:VEVENT"):
+            if ev is not None:
+                events.append(ev)
+            ev = None
+        elif ev is not None and ":" in line:
+            key, val = line.split(":", 1)
+            name = key.split(";", 1)[0].upper()
+            tzid = ""
+            if "TZID=" in key:
+                tzid = " " + key.split("TZID=", 1)[1].split(";")[0]
+            if name in ("SUMMARY", "LOCATION", "DESCRIPTION", "ORGANIZER", "STATUS"):
+                ev[name] = val.replace("\\,", ",").replace("\\n", " ").replace("\\;", ";")
+            elif name in ("DTSTART", "DTEND"):
+                ev[name] = _fmt_dt(val) + tzid
+            elif name == "ATTENDEE":
+                ev.setdefault("ATTENDEES", []).append(val.replace("mailto:", ""))
+    return events
+
+
+def cmd_gmail_attachments(a):
+    cfg = _load()
+    atts = _list_attachments(cfg, a.message_id)
+    if not atts:
+        print("(no attachments on this message)")
+        return
+    for x in atts:
+        print(f"{x['mimeType']:24} {x['size']:>8}B  {x['filename']}\n    id: {x['attachmentId']}")
+
+
+def cmd_gmail_read(a):
+    cfg = _load()
+    data = _fetch_attachment_bytes(cfg, a.message_id, a.attachment_id)
+    if a.out:
+        with open(a.out, "wb") as f:
+            f.write(data)
+        print(f"Wrote {len(data)} bytes to {a.out}")
+    else:
+        sys.stdout.buffer.write(data)
+
+
+def cmd_gmail_ics(a):
+    cfg = _load()
+    atts = [x for x in _list_attachments(cfg, a.message_id)
+            if x["filename"].lower().endswith(".ics") or "calendar" in x["mimeType"]]
+    if not atts:
+        sys.exit("No .ics/calendar attachment found on this message.")
+    for x in atts:
+        raw = _fetch_attachment_bytes(cfg, a.message_id, x["attachmentId"])
+        for ev in parse_ics(raw):
+            print("── Calendar event ──")
+            for label in ("SUMMARY", "DTSTART", "DTEND", "LOCATION", "STATUS", "ORGANIZER"):
+                if ev.get(label):
+                    print(f"  {label.title():10}: {ev[label]}")
+            if ev.get("ATTENDEES"):
+                print(f"  Attendees : {', '.join(ev['ATTENDEES'])}")
+            if ev.get("DESCRIPTION"):
+                print(f"  Notes     : {ev['DESCRIPTION']}")
+            print()
+
+
+# ---------------------------------------------------------------- contacts (People API)
+def cmd_contacts_create(a):
+    cfg = None if a.dry_run else _load()
+    person = {}
+    if a.name:
+        parts = a.name.split(" ", 1)
+        person["names"] = [{"givenName": parts[0], "familyName": parts[1] if len(parts) > 1 else ""}]
+    if a.email:
+        person["emailAddresses"] = [{"value": e} for e in a.email]
+    if a.org or a.title:
+        org = {}
+        if a.org:
+            org["name"] = a.org
+        if a.title:
+            org["title"] = a.title
+        person["organizations"] = [org]
+    if a.phone:
+        person["phoneNumbers"] = [{"value": p} for p in a.phone]
+    if a.notes:
+        # Google Contacts "Notes" == People API biographies (plain text).
+        person["biographies"] = [{"value": a.notes, "contentType": "TEXT_PLAIN"}]
+    if a.dry_run:
+        print("DRY RUN — would POST to people:createContact:\n")
+        print(json.dumps(person, indent=2))
+        return
+    res = _request(cfg, "POST", f"{PEOPLE_API}/people:createContact",
+                   headers={"Content-Type": "application/json"}, json=person)
+    rn = res.get("resourceName", "?")
+    nm = (res.get("names") or [{}])[0].get("displayName", a.name or "(no name)")
+    print(f"✅ Created contact: {nm}")
+    print(f"   resourceName: {rn}")
+    if res.get("organizations"):
+        print(f"   org: {res['organizations'][0].get('name','')}")
+    if a.json:
+        print(json.dumps(res, indent=2))
+
+
+def cmd_contacts_list(a):
+    cfg = _load()
+    params = {
+        "personFields": "names,emailAddresses,organizations,phoneNumbers",
+        "pageSize": str(a.limit),
+        "sortOrder": "LAST_MODIFIED_DESCENDING",
+    }
+    res = _request(cfg, "GET", f"{PEOPLE_API}/people/me/connections?{urllib.parse.urlencode(params)}")
+    conns = res.get("connections", [])
+    if a.json:
+        print(json.dumps(conns, indent=2))
+        return
+    if not conns:
+        print("(no contacts)")
+        return
+    for c in conns:
+        name = (c.get("names") or [{}])[0].get("displayName", "(no name)")
+        email = (c.get("emailAddresses") or [{}])[0].get("value", "")
+        org = (c.get("organizations") or [{}])[0].get("name", "")
+        line = f"{name:32} {email:30}"
+        if org:
+            line += f" [{org}]"
+        print(line.rstrip())
+    if res.get("totalpeople"):
+        print(f"\n({len(conns)} shown of {res['totalpeople']} total)")
+
+
+def cmd_contacts_search(a):
+    cfg = _load()
+    # People API requires a "warmup" request before the first searchContacts call.
+    base = f"{PEOPLE_API}/people:searchContacts"
+    rm = "names,emailAddresses,organizations,phoneNumbers,biographies"
+    requests.get(base, params={"query": "", "readMask": rm},
+                 headers={"Authorization": f"Bearer {_access_token(cfg)}"}, timeout=30)
+    time.sleep(1)
+    res = _request(cfg, "GET", f"{base}?{urllib.parse.urlencode({'query': a.query, 'readMask': rm, 'pageSize': '20'})}")
+    results = res.get("results", [])
+    if a.json:
+        print(json.dumps(results, indent=2))
+        return
+    if not results:
+        print("(no matches)")
+        return
+    for r in results:
+        p = r.get("person", {})
+        name = (p.get("names") or [{}])[0].get("displayName", "(no name)")
+        email = (p.get("emailAddresses") or [{}])[0].get("value", "")
+        org = (p.get("organizations") or [{}])[0].get("name", "")
+        print(f"{name:32} {email:30}" + (f" [{org}]" if org else ""))
+        notes = (p.get("biographies") or [{}])[0].get("value", "")
+        if a.verbose and notes:
+            print(f"    notes: {notes}")
+        if a.verbose:
+            print(f"    resourceName: {p.get('resourceName','')}")
+
+
+# ---------------------------------------------------------------- Google Chat (as the user)
+# Posts as the SIGNED-IN user (their own Google identity) — no attribution prefix. This is
+# distinct from adom-gchat, which posts via an org webhook and prefixes "(on behalf of …)".
+CHAT_API = "https://chat.googleapis.com/v1"
+
+
+def _chat(cfg, path, method="GET", body=None, params=None, allow_404=False):
+    url = path if path.startswith("http") else f"{CHAT_API}/{path.lstrip('/')}"
+    headers = {"Authorization": f"Bearer {_access_token(cfg)}"}
+    data = None
+    if body is not None:
+        data = json.dumps(body)
+        headers["Content-Type"] = "application/json"
+    r = requests.request(method, url, headers=headers, params=params, data=data, timeout=60)
+    if r.status_code in (400, 404) and allow_404:
+        return {}                                    # caller prints a friendly "no DM/space" hint
+    if r.status_code >= 400:
+        sys.exit(f"Chat API error ({r.status_code}) {method} {url}:\n{r.text}")
+    return r.json() if r.content else {}
+
+
+def _find_dm(cfg, email):
+    """Resolve the 1:1 DM space with a person by email → the Space dict (name, spaceUri)."""
+    return _chat(cfg, "spaces:findDirectMessage", params={"name": f"users/{email}"}, allow_404=True)
+
+
+def _space_name(v):
+    """Normalize a space id to a 'spaces/XXX' resource name (caller handles emails)."""
+    return v if v.startswith("spaces/") else f"spaces/{v}"
+
+
+def _msg_text(text):
+    """Message body source: '-' (stdin), '@file', or a literal string."""
+    if text == "-":
+        return sys.stdin.read()
+    if text.startswith("@"):
+        return open(text[1:], encoding="utf-8").read()
+    return text
+
+
+def cmd_chat_spaces(a):
+    cfg = _load()
+    spaces, page = [], None
+    while True:
+        params = {"pageSize": 1000}
+        if page:
+            params["pageToken"] = page
+        j = _chat(cfg, "spaces", params=params)
+        spaces += j.get("spaces", [])
+        page = j.get("nextPageToken")
+        if not page:
+            break
+    if a.json:
+        print(json.dumps(spaces, indent=2, ensure_ascii=False))
+        return
+    for s in spaces:
+        print(f"{s.get('name')}  ·  {s.get('spaceType','?')}  ·  {s.get('displayName') or '(direct message)'}")
+    sys.stderr.write(f"({len(spaces)} spaces — pass a spaces/XXX id OR an email to chat send/read)\n")
+
+
+def cmd_chat_dm(a):
+    cfg = _load()
+    sp = _find_dm(cfg, a.email)
+    name = sp.get("name")
+    if not name:
+        sys.exit(f"no DM/space found for {a.email} — run 'adom-google chat spaces', or check the email")
+    if a.json:
+        print(json.dumps(sp, indent=2, ensure_ascii=False))
+        return
+    print(name + (f"  ·  {sp.get('spaceUri')}" if sp.get("spaceUri") else ""))
+
+
+def cmd_chat_send(a):
+    cfg = _load()
+    if "@" in a.to:
+        sp = _find_dm(cfg, a.to)
+        space = sp.get("name")
+        if not space:
+            sys.exit(f"no DM/space found for {a.to} — run 'adom-google chat spaces', or check the email")
+        sys.stderr.write(f"(auto-resolved DM {space} for {a.to})\n")
+        label = a.to
+    else:
+        space = _space_name(a.to)
+        sp = _chat(cfg, space)                       # validate + fetch spaceUri / displayName
+        label = sp.get("displayName") or space
+    body = {"text": _msg_text(a.text)}
+    params = None
+    if a.thread:
+        body["thread"] = {"threadKey": a.thread}
+        params = {"messageReplyOption": "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"}
+    msg = _chat(cfg, f"{space}/messages", method="POST", body=body, params=params)
+    uri = sp.get("spaceUri", "")
+    who = (msg.get("sender") or {}).get("displayName") or "you"
+    print(msg.get("name", "") + (f"  ·  {uri}" if uri else ""))
+    sys.stderr.write(f"→ posted to {label} as {who}" + (f" · {uri}" if uri else "") + "\n")
+
+
+def cmd_chat_read(a):
+    cfg = _load()
+    if "@" in a.frm:
+        sp = _find_dm(cfg, a.frm)
+        space = sp.get("name")
+        if not space:
+            sys.exit(f"no DM/space found for {a.frm} — run 'adom-google chat spaces', or check the email")
+    else:
+        space = _space_name(a.frm)
+    j = _chat(cfg, f"{space}/messages", params={"pageSize": a.limit, "orderBy": "createTime desc"})
+    msgs = j.get("messages", [])
+    if a.json:
+        print(json.dumps(msgs, indent=2, ensure_ascii=False))
+        return
+    for m in reversed(msgs):                         # show oldest → newest of the recent batch
+        who = (m.get("sender") or {}).get("displayName") or (m.get("sender") or {}).get("name", "?")
+        print(f"{who}: {m.get('text','')}")
+
+
+# ---------------------------------------------------------------- generic API passthrough
+def cmd_api(a):
+    """Sign ANY Google REST/Discovery call with the stored token — the 'whole board'.
+    Reach of this command == the scopes the stored token holds (see `status`); add scopes
+    in SCOPES + re-`auth` to widen it, and enable the API in the GCP project.
+
+    Examples:
+      adom-google api https://sheets.googleapis.com/v4/spreadsheets/<id>/values/A1:D10
+      adom-google api -X POST https://sheets.googleapis.com/v4/spreadsheets -d '{"properties":{"title":"BOM"}}'
+      adom-google api -X POST https://docs.googleapis.com/v1/documents/<id>:batchUpdate -d @reqs.json
+    """
+    cfg = _load()
+    url = a.url if a.url.startswith("http") else "https://" + a.url.lstrip("/")
+    headers = {"Authorization": f"Bearer {_access_token(cfg)}"}
+    body = None
+    if getattr(a, "upload_file", None):
+        body = open(a.upload_file, "rb").read()  # raw bytes: Drive media, YouTube resumable PUT, etc.
+        headers["Content-Type"] = a.content_type or "application/octet-stream"
+    elif a.data is not None:
+        body = open(a.data[1:], "rb").read() if a.data.startswith("@") else a.data
+        headers["Content-Type"] = a.content_type or "application/json"
+    params = dict(q.split("=", 1) for q in (a.query or []))
+    r = requests.request(a.method.upper(), url, headers=headers,
+                         params=params or None, data=body, timeout=120)
+    sys.stderr.write(f"HTTP {r.status_code} {a.method.upper()} {url}\n")
+    ct = r.headers.get("content-type", "")
+    if a.raw or "application/json" not in ct:
+        sys.stdout.buffer.write(r.content)
+    else:
+        print(json.dumps(r.json(), indent=2, ensure_ascii=False))
+    sys.exit(0 if r.status_code < 400 else 1)
+
+
+# ---------------------------------------------------------------- auth: gateway flow
+def _minimal_ws_roundtrip(ws_url, send_msgs, want_types, timeout=600):
+    """Tiny RFC6455 client (stdlib only): connect, send JSON text frames, return the first
+    received JSON message whose 'type' == want_type. Used for the OAuth Gateway handshake so
+    adom-google stays a single dependency-light file (no `ws`/`websockets` package).
+
+    NOTE: this path is exercised only when the gateway is live. The `--manual` flow is the
+    fallback that works without the gateway."""
+    u = urllib.parse.urlparse(ws_url)
+    host = u.hostname
+    port = u.port or (443 if u.scheme == "wss" else 80)
+    path = u.path or "/"
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+
+    raw = socket.create_connection((host, port), timeout=30)
+    if u.scheme == "wss":
+        raw = ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n"
+           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+           f"Sec-WebSocket-Version: 13\r\n\r\n")
+    raw.sendall(req.encode())
+
+    # read handshake response headers
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = raw.recv(4096)
+        if not chunk:
+            raise RuntimeError("gateway closed during handshake")
+        buf += chunk
+    if b" 101 " not in buf.split(b"\r\n", 1)[0]:
+        raise RuntimeError("gateway did not accept websocket upgrade: " + buf[:80].decode("latin1"))
+    leftover = buf.split(b"\r\n\r\n", 1)[1]
+
+    def _send_text(s):
+        payload = s.encode()
+        mask = secrets.token_bytes(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        header = b"\x81"  # FIN + text
+        n = len(payload)
+        if n < 126:
+            header += struct.pack("!B", 0x80 | n)
+        elif n < 65536:
+            header += struct.pack("!BH", 0x80 | 126, n)
+        else:
+            header += struct.pack("!BQ", 0x80 | 127, n)
+        raw.sendall(header + mask + masked)
+
+    inbuf = bytearray(leftover)
+
+    def _recv_frame():
+        nonlocal inbuf
+        while True:
+            while len(inbuf) < 2:
+                inbuf += raw.recv(4096)
+            b0, b1 = inbuf[0], inbuf[1]
+            opcode = b0 & 0x0F
+            ln = b1 & 0x7F
+            idx = 2
+            if ln == 126:
+                while len(inbuf) < 4:
+                    inbuf += raw.recv(4096)
+                ln = struct.unpack("!H", inbuf[2:4])[0]; idx = 4
+            elif ln == 127:
+                while len(inbuf) < 10:
+                    inbuf += raw.recv(4096)
+                ln = struct.unpack("!Q", inbuf[2:10])[0]; idx = 10
+            while len(inbuf) < idx + ln:
+                inbuf += raw.recv(4096)
+            data = bytes(inbuf[idx:idx + ln])
+            del inbuf[:idx + ln]
+            if opcode == 0x8:  # close
+                raise RuntimeError("gateway closed the connection")
+            if opcode == 0x9:  # ping → pong
+                raw.sendall(b"\x8a\x80" + secrets.token_bytes(4))
+                continue
+            if opcode in (0x1, 0x2):
+                return data
+
+    for m in send_msgs:
+        _send_text(json.dumps(m))
+
+    raw.settimeout(timeout)
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            data = _recv_frame()
+            try:
+                msg = json.loads(data.decode())
+            except Exception:
+                continue
+            if msg.get("type") == "error":
+                raise RuntimeError("gateway error: " + str(msg.get("error") or msg.get("detail")))
+            if msg.get("type") in want_types:
+                return msg
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+    raise RuntimeError("timed out waiting for the gateway callback")
+
+
+def _exchange_code(cfg, code, redirect_uri, scopes, mode):
+    cid, csec = _client_creds(cfg)
+    r = requests.post(TOKEN_URL, data={
+        "client_id": cid, "client_secret": csec, "code": code,
+        "redirect_uri": redirect_uri, "grant_type": "authorization_code",
+    }, timeout=30)
+    if r.status_code != 200:
+        sys.exit(f"Code exchange failed ({r.status_code}): {r.text}")
+    rt = r.json().get("refresh_token")
+    if not rt:
+        sys.exit("No refresh_token returned (re-run auth; needs access_type=offline & prompt=consent).")
+    cfg["refresh_token"] = rt
+    cfg["scopes"] = scopes
+    cfg["mode"] = mode
+    cfg["broker"] = False
+    cfg.pop("_migrated_from", None)
+    cfg.pop("_pending_mode", None)
+    _save(cfg)
+
+
+def _store_broker_tokens(cfg, tokens, scopes, mode):
+    """Gateway broker returned the tokens directly — no client secret on this container."""
+    cfg["refresh_token"] = tokens["refresh_token"]
+    if tokens.get("access_token"):
+        cfg["access_token"] = tokens["access_token"]
+        cfg["access_expires"] = time.time() + int(tokens.get("expires_in", 3600)) - 60
+    cfg["scopes"] = scopes
+    cfg["mode"] = mode
+    cfg["broker"] = True
+    cfg["app"] = _provider()["app"]
+    cfg.pop("client_secret", None)   # broker mode: never keep a secret locally
+    cfg.pop("_migrated_from", None)
+    cfg.pop("_pending_mode", None)
+    _save(cfg)
+
+
+def cmd_auth(a):
+    cfg = _maybe_load_raw() or {}
+    mode = "full" if a.full else "safe"
+    scopes = _scopes_for(mode)
+    if a.manual:
+        return _auth_manual(cfg, scopes, mode)
+    # Gateway flow — one static redirect, code routed back over WebSocket. Needs a provider.
+    pr = _provider()
+    if not pr["gateway_url"]:
+        sys.exit(NO_PROVIDER_HINT)
+    cid, _ = _client_creds(cfg)
+    state = secrets.token_urlsafe(24)
+    params = {
+        "client_id": cid, "redirect_uri": pr["gateway_redirect"], "response_type": "code",
+        "scope": " ".join(scopes), "access_type": "offline", "prompt": "consent",
+        "state": state,
+    }
+    # broker=False → RELAY mode: the gateway just relays the code back; THIS container exchanges
+    # it locally with the org's own secret. (None/True → broker mode: gateway exchanges.)
+    want_exchange = pr.get("broker") is not False
+    auth_link = AUTH_URL + "?" + urllib.parse.urlencode(params)
+    print(f"OAuth Gateway flow — {mode.upper()} mode"
+          + ("  (full Drive/Sheets/Docs/Slides + delete)" if mode == "full"
+             else "  (safe: only files this app makes; no 'delete all')") + ".\n")
+    print("1) Open this URL and approve with your Google Workspace account:\n")
+    print("   " + auth_link + "\n")
+    print("2) Waiting for the gateway… (up to 10 min)")
+    try:
+        # Broker mode: the gateway exchanges the code and returns tokens (the client
+        # secret stays on the gateway). Falls back to relayed code if it can't broker.
+        msg = _minimal_ws_roundtrip(
+            pr["gateway_ws"],
+            send_msgs=[{"type": "register", "state": state, "provider": "google",
+                        "app": pr["app"], "exchange": want_exchange}],
+            want_types=("tokens", "callback"),
+        )
+    except Exception as e:
+        sys.exit(f"\nGateway flow failed: {e}\n"
+                 f"Is the OAuth Gateway up? ({pr['gateway_url']})\n"
+                 f"Fallback: run `adom-google auth --manual`.")
+    if msg.get("state") != state:
+        sys.exit("State mismatch from gateway — aborting.")
+    if msg.get("type") == "tokens":
+        _store_broker_tokens(cfg, msg["tokens"], scopes, mode)
+        print(f"\n✅ Authorized via gateway broker ({mode} mode). Token stored (0600); "
+              "client secret never touched this container.")
+    else:
+        _exchange_code(cfg, msg["code"], pr["gateway_redirect"], scopes, mode)
+        print(f"\n✅ Authorized via gateway ({mode} mode). Refresh token stored (0600).")
+    print("   Scopes: " + ", ".join(s.split("/")[-1] for s in scopes))
+
+
+def _auth_manual(cfg, scopes, mode):
+    cid, _ = _client_creds(cfg)
+    if not cfg.get("client_id"):
+        print("Manual flow uses the configured OAuth client, but its redirect must allow")
+        print(f"`{MANUAL_REDIRECT}`. If you hit redirect_uri_mismatch, run:")
+        print("   adom-google init <your_desktop_client_id> <your_desktop_client_secret>\n")
+    cfg["_pending_mode"] = mode       # so auth-code knows which scope profile was requested
+    _save(cfg)
+    params = {
+        "client_id": cid, "redirect_uri": MANUAL_REDIRECT, "response_type": "code",
+        "scope": " ".join(scopes), "access_type": "offline", "prompt": "consent",
+    }
+    print(f"Manual (desktop-client) flow — {mode.upper()} mode.\n")
+    print("1) Open this URL and approve:\n")
+    print("   " + AUTH_URL + "?" + urllib.parse.urlencode(params))
+    print("\n2) The page will fail to load (expected). Copy the `code` value from the address")
+    print("   bar, then run:\n\n   adom-google auth-code '<paste-code-here>'")
+
+
+def cmd_auth_code(a):
+    cfg = _maybe_load_raw() or {}
+    mode = cfg.get("_pending_mode", "safe")
+    scopes = _scopes_for(mode)
+    _exchange_code(cfg, a.code, MANUAL_REDIRECT, scopes, mode)
+    print(f"✅ Authorized ({mode} mode). Refresh token stored (0600).")
+    print("   Scopes: " + ", ".join(s.split("/")[-1] for s in scopes))
+
+
+def cmd_init(a):
+    cfg = _maybe_load_raw() or {}
+    cfg["client_id"] = a.client_id
+    cfg["client_secret"] = a.client_secret
+    _save(cfg)
+    print(f"Saved client credentials to {CFG}. Next: `adom-google auth --manual`")
+
+
+def cmd_provider_set(a):
+    """Write the OAuth provider (gateway + client) to ~/.config/adom-google/provider.json.
+    This is what the private `adom-google-adom` package drops for Adom employees; self-hosters
+    point it at their own gateway + client."""
+    prov = {}
+    if os.path.exists(PROVIDER_PATH):
+        try:
+            with open(PROVIDER_PATH) as f:
+                prov = json.load(f)
+        except Exception:
+            prov = {}
+    if a.gateway:       prov["gateway_url"] = a.gateway.rstrip("/")
+    if a.ws:            prov["gateway_ws"] = a.ws
+    if a.client_id:     prov["client_id"] = a.client_id
+    if a.client_secret: prov["client_secret"] = a.client_secret
+    if a.app:           prov["app"] = a.app
+    os.makedirs(CFG_DIR, exist_ok=True)
+    fd = os.open(PROVIDER_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(prov, f, indent=2)
+    os.chmod(PROVIDER_PATH, 0o600)
+    print(f"Saved provider → {PROVIDER_PATH} (0600).")
+    print("Next: ask the user safe vs full, then `adom-google auth`.")
+
+
+def cmd_provider_show(a):
+    pr = _provider()
+    if os.path.exists(PROVIDER_PATH):       src = PROVIDER_PATH
+    elif os.path.exists(BUNDLED_PROVIDER):  src = BUNDLED_PROVIDER + " (bundled)"
+    elif os.path.exists(LEGACY_CREDS):      src = LEGACY_CREDS + " (legacy)"
+    elif os.environ.get("OAUTH_GATEWAY_URL"): src = "environment"
+    else:                                   src = "(none — run `provider set`)"
+    print(f"app:           {pr['app']}")
+    print(f"gateway_url:   {pr['gateway_url'] or '(UNSET)'}")
+    print(f"gateway_ws:    {pr['gateway_ws'] or '(derived from gateway_url)'}")
+    print(f"client_id:     {(pr['client_id'][:22] + '…') if pr['client_id'] else '(UNSET)'}")
+    print(f"client_secret: {'present' if pr.get('client_secret') else '(none — broker mode)'}")
+    print(f"source:        {src}")
+
+
+def cmd_onboard(a):
+    """Guided org onboarding. Prints the exact plan + canonical values (or --json for the
+    skill that drives the browser). The actual Cloud-Console clicking is done by the
+    `adom-google-onboarding` skill via the native browser; this command supplies the truth."""
+    org = getattr(a, "org", None)
+    cfg = _onboard_config(org)
+    if getattr(a, "json", False):
+        print(json.dumps(cfg, indent=2))
+        return
+    R = cfg["redirect_uri"]
+    print("┌─ adom-google · onboard your org to Google Workspace ─────────────────────────┐")
+    print("│  One-time setup: your team gets its OWN Google OAuth client so the AI can     │")
+    print("│  read mail, post Chat on your behalf, build Slides/Sheets/Docs, search Drive. │")
+    print("│  Your client SECRET stays on YOUR machine (0600). Adom only lends its public  │")
+    print("│  callback URL — it never sees your secret.                                    │")
+    print("└──────────────────────────────────────────────────────────────────────────────┘\n")
+    print("The AI can drive your real browser through every step below and auto-fill the")
+    print("fields (recommended) — or you can do it by hand. Either way, the exact values:\n")
+    print("1) Create / pick a Google Cloud project:")
+    print("     " + cfg["console"]["project_create"])
+    print("\n2) Enable all nine APIs in ONE click:")
+    print("     " + cfg["enable_apis_url"])
+    for ap in cfg["apis"]:
+        print(f"        • {ap['label']}")
+    print("\n3) OAuth consent screen  →  User type = Internal")
+    print("     " + cfg["console"]["consent_screen"])
+    print(f"        App name:  {cfg['consent']['app_name']}")
+    print("\n4) Create an OAuth client  →  Application type = Web application")
+    print("     " + cfg["console"]["create_client"])
+    print("     ⚠ Authorized redirect URI — paste EXACTLY (this is the gateway callback):")
+    print("        " + R)
+    print("\n5) Copy the Client ID + Client secret it shows, then run:")
+    print("     adom-google onboard finish --org <your-org-slug> \\")
+    print("         --client-id <client-id> --client-secret <client-secret>")
+    print("\n6) Pick safe vs full mode, then authorize:")
+    print("     adom-google auth          # one Allow click with your Workspace account")
+    print("\n(Chat also needs a one-time Chat-app config: " + cfg["console"]["chat_config"] + ")")
+    print("\n" + ONBOARD_HINT)
+
+
+def cmd_onboard_finish(a):
+    """Record the org's freshly-created OAuth client and wire RELAY mode (secret stays local)."""
+    gw = (a.gateway or ADOM_SHARED_GATEWAY).rstrip("/")
+    prov = {}
+    if os.path.exists(PROVIDER_PATH):
+        try:
+            with open(PROVIDER_PATH) as f:
+                prov = json.load(f)
+        except Exception:
+            prov = {}
+    prov["gateway_url"] = gw
+    prov["client_id"] = a.client_id
+    prov["client_secret"] = a.client_secret      # the org's OWN secret, on the org's OWN box
+    prov["app"] = a.org
+    prov["broker"] = False                         # relay mode: gateway relays, we exchange locally
+    os.makedirs(CFG_DIR, exist_ok=True)
+    fd = os.open(PROVIDER_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(prov, f, indent=2)
+    os.chmod(PROVIDER_PATH, 0o600)
+    print(f"✅ Saved provider → {PROVIDER_PATH} (0600, RELAY mode).")
+    print(f"   org/app:      {a.org}")
+    print(f"   gateway:      {gw}  (shared callback; your secret never leaves this box)")
+    print(f"   redirect_uri: {gw}/callback  (must match your OAuth client)")
+    print("\nNext: ask the user safe vs full, then `adom-google auth`.")
+
+
+def cmd_setup(a):
+    # Canonical first-run entry point. Always prints the ask-the-user hint (even mid-config),
+    # so the installing AI is reminded to ask the safe/full question before authorizing.
+    print(SETUP_HINT)
+
+
+def cmd_status(a):
+    cfg = _maybe_load_raw()
+    if not cfg or not cfg.get("refresh_token"):
+        print(SETUP_HINT)
+        return
+    pr = _provider()
+    cid = cfg.get("client_id") or pr["client_id"] or "(none)"
+    src = "config" if cfg.get("client_id") else ("provider" if pr["client_id"] else "UNSET")
+    print(f"Config:      {CFG}")
+    print(f"Provider:    gateway={pr['gateway_url'] or '(UNSET — run `provider set`)'}  app={pr['app']}")
+    print(f"OAuth client: {(cid[:18] + '…') if cid != '(none)' else cid} (from {src})")
+    print(f"Refresh token: {'present' if cfg.get('refresh_token') else 'MISSING — run auth'}")
+    print(f"Mode:         {cfg.get('mode', '(unset)')}  (safe = no 'delete all'; full = broad)")
+    relay = pr.get("broker") is False
+    print(f"Auth:         {'broker (secret on gateway, none here)' if cfg.get('broker') else ('relay (your secret 0600 here; Adom lends only its callback)' if relay else 'local (client secret in config)')}")
+    print(f"Scopes:       {', '.join(s.split('/')[-1] for s in (cfg.get('scopes') or [])) or '(none)'}")
+    if cfg.get("_migrated_from"):
+        print(f"Migrated from: {cfg['_migrated_from']} (gmail.readonly only — run `auth` to add contacts)")
+    # never print client_secret / refresh_token values
+
+
+HELP = """adom-google — Google Workspace from your Adom container (Gmail, Contacts, …)
+
+AUTH (one time; one consent → long-lived refresh token, stored 0600):
+  adom-google auth              SAFE mode (default): create/edit Gmail/Contacts/Calendar +
+                                only the Drive/Sheets/Docs/Slides files THIS app makes.
+                                No scary "see & delete ALL your files" on the consent screen.
+  adom-google auth --full       FULL mode: broad access to ALL your existing Drive/Sheets/
+                                Docs/Slides/Calendars (incl. delete). For trusted users.
+  adom-google auth --manual     fallback: desktop-client paste flow (combine w/ --full)
+  adom-google auth-code '<code>'   finish the --manual flow
+  adom-google init <id> <secret>   set an explicit desktop OAuth client (for --manual)
+  adom-google status            show mode + what's authorised (never prints secrets)
+
+ONBOARD A NEW ORG (give your team its OWN Google OAuth client — the AI hand-holds you):
+  adom-google onboard [--org <slug>]   print the step-by-step plan + exact values to use
+  adom-google onboard --json           same, machine-readable (the onboarding skill reads this)
+  adom-google onboard finish --org <slug> --client-id <id> --client-secret <secret>
+                                       record your new client (RELAY mode: secret stays 0600
+                                       on THIS box; rides Adom's shared callback URL)
+  → The `adom-google-onboarding` skill drives your real browser through Google Cloud Console
+    and auto-fills the fields. Then: pick safe/full, `adom-google auth`, done.
+
+GMAIL (read-only; migrated from adom-gmail):
+  adom-google gmail attachments <messageId>            list attachments + ids
+  adom-google gmail read <messageId> <attId> [-o f]    dump attachment bytes
+  adom-google gmail ics  <messageId>                   parse .ics invite(s)
+
+CONTACTS (Google People API; read + write):
+  adom-google contacts create --name "First Last" [--org O] [--title T] \\
+      [--email a@b.com ...] [--phone +1... ...] [--notes "..."] [--json]
+  adom-google contacts list [--limit N] [--json]
+  adom-google contacts search <query> [-v] [--json]
+
+CHAT (Google Chat — posts as YOU, your own identity, no attribution prefix;
+      adom-gchat is the other one — it posts via an org webhook with "(on behalf of)"):
+  adom-google chat spaces [--json]                     list your spaces (id · type · name)
+  adom-google chat dm <email> [--json]                 resolve the 1:1 DM space with a person
+  adom-google chat send --to <space-id|email> "<text>" post a message (email auto-resolves DM)
+      "<text>" may be '-' (stdin) or '@file'; --thread <key> replies in a thread
+  adom-google chat read --from <space-id|email> [--limit N] [--json]   recent messages
+
+API (generic passthrough — hit ANY Google API with your token; the "whole board"):
+  adom-google api <url> [-X METHOD] [-d '<json>'|@file] [-q k=v ...] [--raw]
+    e.g. adom-google api https://sheets.googleapis.com/v4/spreadsheets/<id>/values/A1:C5
+         adom-google api -X POST https://docs.googleapis.com/v1/documents -d '{"title":"Report"}'
+  Reach == the scopes the token holds (see `status`). Widen via SCOPES + re-`auth`
+  + enabling that API in the GCP project.
+
+DRIVE / CALENDAR / SHEETS / DOCS / SLIDES: either use `api` above, or add a typed
+subcommand. Add the scope in SCOPES (top of this file) and re-run `auth`.
+
+SECURITY: config is 0600; secrets are never echoed to stdout/stderr or logs.
+"""
+
+
+def main():
+    p = argparse.ArgumentParser(add_help=False)
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("auth"); s.add_argument("--manual", action="store_true"); s.add_argument("--full", action="store_true", help="request the FULL (broad, incl. delete-all) scope set; default is SAFE"); s.set_defaults(fn=cmd_auth)
+    s = sub.add_parser("auth-code"); s.add_argument("code"); s.set_defaults(fn=cmd_auth_code)
+    s = sub.add_parser("init"); s.add_argument("client_id"); s.add_argument("client_secret"); s.set_defaults(fn=cmd_init)
+    pv = sub.add_parser("provider"); pvs = pv.add_subparsers(dest="sub")
+    x = pvs.add_parser("set")
+    x.add_argument("--gateway"); x.add_argument("--ws")
+    x.add_argument("--client-id", dest="client_id"); x.add_argument("--client-secret", dest="client_secret")
+    x.add_argument("--app"); x.set_defaults(fn=cmd_provider_set)
+    x = pvs.add_parser("show"); x.set_defaults(fn=cmd_provider_show)
+    s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
+    s = sub.add_parser("setup"); s.set_defaults(fn=cmd_setup)
+
+    ob = sub.add_parser("onboard"); ob.add_argument("--org"); ob.add_argument("--json", action="store_true")
+    ob.set_defaults(fn=cmd_onboard)
+    obx = ob.add_subparsers(dest="sub")
+    y = obx.add_parser("finish")
+    y.add_argument("--org", required=True)
+    y.add_argument("--client-id", dest="client_id", required=True)
+    y.add_argument("--client-secret", dest="client_secret", required=True)
+    y.add_argument("--gateway", help="override the shared callback gateway (advanced)")
+    y.set_defaults(fn=cmd_onboard_finish)
+
+    g = sub.add_parser("gmail"); gs = g.add_subparsers(dest="sub")
+    x = gs.add_parser("attachments"); x.add_argument("message_id"); x.set_defaults(fn=cmd_gmail_attachments)
+    x = gs.add_parser("read"); x.add_argument("message_id"); x.add_argument("attachment_id"); x.add_argument("-o", "--out"); x.set_defaults(fn=cmd_gmail_read)
+    x = gs.add_parser("ics"); x.add_argument("message_id"); x.set_defaults(fn=cmd_gmail_ics)
+
+    c = sub.add_parser("contacts"); cs = c.add_subparsers(dest="sub")
+    x = cs.add_parser("create")
+    x.add_argument("--name"); x.add_argument("--org"); x.add_argument("--title")
+    x.add_argument("--email", action="append"); x.add_argument("--phone", action="append")
+    x.add_argument("--notes"); x.add_argument("--json", action="store_true")
+    x.add_argument("--dry-run", dest="dry_run", action="store_true", help="print the People API payload without sending")
+    x.set_defaults(fn=cmd_contacts_create)
+    x = cs.add_parser("list"); x.add_argument("--limit", type=int, default=50); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_contacts_list)
+    x = cs.add_parser("search"); x.add_argument("query"); x.add_argument("-v", "--verbose", action="store_true"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_contacts_search)
+
+    ch = sub.add_parser("chat"); chx = ch.add_subparsers(dest="sub")
+    x = chx.add_parser("spaces"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_chat_spaces)
+    x = chx.add_parser("dm"); x.add_argument("email"); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_chat_dm)
+    x = chx.add_parser("send"); x.add_argument("--to", required=True, help="spaces/XXX id OR an email (auto-resolves the DM)"); x.add_argument("text", help="message text, or '-' for stdin, or '@file'"); x.add_argument("--thread", help="threadKey for a threaded reply"); x.set_defaults(fn=cmd_chat_send)
+    x = chx.add_parser("read"); x.add_argument("--from", dest="frm", required=True, help="spaces/XXX id OR an email"); x.add_argument("--limit", type=int, default=20); x.add_argument("--json", action="store_true"); x.set_defaults(fn=cmd_chat_read)
+
+    # Generic passthrough — hit ANY Google API with the stored token.
+    x = sub.add_parser("api")
+    x.add_argument("url", help="full URL or host/path (https:// assumed)")
+    x.add_argument("-X", "--method", default="GET")
+    x.add_argument("-d", "--data", help="JSON body string, or @file")
+    x.add_argument("-q", "--query", action="append", help="key=value query param (repeatable)")
+    x.add_argument("--raw", action="store_true", help="print raw bytes (don't pretty-print JSON)")
+    x.add_argument("--upload-file", dest="upload_file", help="send a file's raw bytes as the body (binary uploads: Drive media, YouTube resumable PUT)")
+    x.add_argument("--content-type", dest="content_type", help="override Content-Type (e.g. video/mp4)")
+    x.set_defaults(fn=cmd_api)
+
+    sub.add_parser("help")
+
+    if len(sys.argv) == 1 or sys.argv[1] in ("help", "-h", "--help"):
+        print(HELP); return
+    args = p.parse_args()
+    if not hasattr(args, "fn"):
+        print(HELP); return
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
