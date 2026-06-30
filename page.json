@@ -4,7 +4,7 @@
   "slug": "adom-google",
   "title": "Adom Google",
   "brief": "Drive your whole Google Workspace from the terminal — Gmail, Drive, Sheets, Docs, Slides, Calendar, Tasks, Chat + any Google API.",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "visibility": "public",
   "install": {
     "binary_name": "adom-google",

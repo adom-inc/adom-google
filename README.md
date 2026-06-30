@@ -378,4 +378,4 @@ that it's a service Adom runs.
 Built and battle-tested at **[Adom](https://adom.inc)**. Questions, or want us to host your
 org's OAuth? **support@adom.inc**.
 
-> [Read the full SKILL.md source](/blob/app/adom-google/skills/adom-google/SKILL.md)
+> [Read the full SKILL.md source](/blob/app/adom-google/SKILL.md)
