@@ -1,6 +1,6 @@
 {
   "slug": "adom-google",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "type": "app",
   "license": "MIT",
   "description": "Drive your whole Google Workspace from the terminal — Gmail, Contacts, Drive, Sheets, Docs, Slides, Calendar, Tasks, Google Chat, plus a generic `api` passthrough to hit ANY Google API. Open source, ships with NO OAuth provider baked in: point it at your own token-broker gateway (`provider set`), buy a managed one, or — Adom staff — install the private adom-google-adom provider. One-click OAuth, no client secret on your machine. First run asks safe mode (no delete) vs full mode (incl. delete).",
@@ -30,7 +30,7 @@
     "binary_name": "adom-google"
   },
   "hero": {
-    "path": "docs/hero.png"
+    "path": "docs/hero-v2.png"
   },
   "discovery_pitch": "Drive your whole Google Workspace from the terminal through your AI — read Gmail (and its attachments), search Drive, build Sheets/Docs/Slides, manage Calendar & Tasks, and post to Google Chat as yourself. One OAuth, any Google API.",
   "discovery_triggers": [
@@ -75,7 +75,7 @@
     "LICENSE",
     "MIGRATION.md",
     "provider.example.json",
-    "docs/hero.png",
+    "docs/hero-v2.png",
     "docs/enable-apis.png",
     "docs/chat-reads-email.png",
     "docs/onboard-1-plan.png",
