@@ -4,7 +4,7 @@
   "slug": "adom-google",
   "title": "Adom Google",
   "brief": "Drive your whole Google Workspace from the terminal — Gmail, Drive, Sheets, Docs, Slides, Calendar, Tasks, Chat + any Google API.",
-  "version": "0.6.9",
+  "version": "0.7.0",
   "visibility": "public",
   "install": {
     "binary_name": "adom-google",
@@ -28,7 +28,7 @@
   ],
   "license": "MIT",
   "hero": {
-    "path": "screenshots/hero-logos-v3.png",
+    "path": "screenshots/hero-grid-v4.png",
     "type": "image"
   },
   "sample_prompts": [
@@ -68,12 +68,12 @@
   ],
   "discovery_pitch": "Drive your whole Google Workspace from the terminal through your AI — read Gmail (and its attachments), search Drive, build Sheets/Docs/Slides, manage Calendar & Tasks, and post to Google Chat as yourself. One OAuth, any Google API.",
   "metadata": {
-    "hero_path": "screenshots/hero-logos-v3.png",
+    "hero_path": "screenshots/hero-grid-v4.png",
     "hero_type": "image"
   },
   "created_at": "2026-06-16T22:28:58.933Z",
   "updated_at": "2026-06-17T00:57:47.322Z",
   "skills": [],
-  "hero_path": "screenshots/hero-logos-v3.png",
+  "hero_path": "screenshots/hero-grid-v4.png",
   "hero_type": "image"
 }
