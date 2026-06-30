@@ -27,7 +27,7 @@ token and zero per-API glue code:
 adom-google api -X POST https://sheets.googleapis.com/v4/spreadsheets -d '{"properties":{"title":"BOM"}}'
 adom-google api -X POST https://docs.googleapis.com/v1/documents -d '{"title":"Project brief"}'
 adom-google api -X POST https://www.googleapis.com/calendar/v3/calendars/primary/events -d '{"summary":"Kickoff","start":{...},"end":{...}}'
-adom-google api -X POST https://chat.googleapis.com/v1/spaces/<id>/messages -d '{"text":"shipped 🚀"}'
+adom-google api -X POST https://chat.googleapis.com/v1/spaces/<id>/messages -d '{"text":"shipped"}'
 adom-google api  https://www.googleapis.com/drive/v3/files -q q="name contains 'invoice'"
 ```
 
@@ -65,28 +65,28 @@ client_id) is the only account-specific piece. Four ways to get one:
 
 ### 1. You're at Adom → just use it
 ```bash
-adompkg install adom-google-adom   # pulls the CLI + drops the Adom provider config
+adom-wiki pkg install adom/adom-google-adom   # pulls the CLI + drops the Adom provider config
 adom-google setup                  # asks: safe mode (no delete) or full mode?
 adom-google auth                   # one Allow click — done
 ```
 (`adom-google-adom` is a tiny private, Adom-only package that writes the Adom provider; the
 public `adom-google` package contains none of Adom's infrastructure.)
 
-### 2. ⭐ Any other org → self-serve onboarding (the AI sets up Google *for* you)
+### 2. Any other org → self-serve onboarding (the AI sets up Google *for* you)
 This is the one most teams want. You don't touch the Google Cloud Console — **your AI drives
 your own browser through it**, auto-filling every field, while you watch and click the couple
 of buttons Google reserves for a human:
 
 ```bash
-adompkg install adom-google         # the open-source CLI
-adom-google onboard --org <your-org>   # the AI takes it from here ↓
+adom-wiki pkg install adom/adom-google         # the open-source CLI
+adom-google onboard --org <your-org>   # the AI takes it from here
 ```
 
 Your team gets its **own** Google OAuth client (you own it, you control it), and your
 **client secret never leaves your machine** — Adom only lends a shared callback URL. Full
 walkthrough with screenshots below: **[Onboarding your org](#onboarding-your-org--the-ai-sets-up-google-for-you)**.
 
-### 3. Prefer we run it for you → managed 💵
+### 3. Prefer we run it for you → managed
 Email **support@adom.inc**. We stand up a dedicated OAuth gateway container for your org
 (~**$5/month**) wired to a Google client for your domain; your whole team gets the full
 capability set with zero console wrestling and zero secret management on your side.
@@ -170,15 +170,15 @@ Every Google Workspace surface, with typed shortcuts for the common flows and th
 
 | App | What you can do | Safe mode | Full mode |
 |---|---|---|---|
-| **Gmail** | read messages, attachments & `.ics` invites, labels, trash, organize | ✅ read + organize | ✅ read + organize |
-| **Contacts** (People) | create / list / search contacts, store service identities | ✅ full read/write | ✅ full read/write |
-| **Calendar** | create / move / delete events, invite guests, list agenda | ✅ events | ✅ + manage calendars |
-| **Tasks** | create / list / complete task lists & tasks | ✅ full | ✅ full |
-| **Google Chat** | post to spaces, list spaces, read space messages | ✅ post + read | ✅ post + read |
-| **Drive** | upload / download / search / share / organize files | ⚠️ only files this app creates | ✅ **all** files incl. delete |
-| **Sheets** | create spreadsheets, read/write cells, formulas, formatting | ⚠️ only sheets it creates | ✅ **all** spreadsheets |
-| **Docs** | create docs, insert/replace text, fill templates | ⚠️ only docs it creates | ✅ **all** documents |
-| **Slides** | build decks, add slides, replace text/images | ⚠️ only decks it creates | ✅ **all** presentations |
+| **Gmail** | read messages, attachments & `.ics` invites, labels, trash, organize | read + organize | read + organize |
+| **Contacts** (People) | create / list / search contacts, store service identities | full read/write | full read/write |
+| **Calendar** | create / move / delete events, invite guests, list agenda | events | + manage calendars |
+| **Tasks** | create / list / complete task lists & tasks | full | full |
+| **Google Chat** | post to spaces, list spaces, read space messages | post + read | post + read |
+| **Drive** | upload / download / search / share / organize files | only files this app creates | **all** files incl. delete |
+| **Sheets** | create spreadsheets, read/write cells, formulas, formatting | only sheets it creates | **all** spreadsheets |
+| **Docs** | create docs, insert/replace text, fill templates | only docs it creates | **all** documents |
+| **Slides** | build decks, add slides, replace text/images | only decks it creates | **all** presentations |
 | **Any other Google API** | YouTube, Forms, Apps Script, Admin SDK, Photos… | via `api` passthrough | via `api` passthrough |
 
 **Safe mode** uses the narrow scopes (`gmail.modify`, `contacts`, `calendar.events`,
@@ -205,18 +205,18 @@ Talk to your AI in plain English. Each line below is something you'd actually *s
 is the `adom-google` call your agent runs to make it happen. Everything not shown is still one
 `api` call away.
 
-**📧 Gmail** — *"Grab the invoice PDF from that email and save it."*
+**Gmail** — *"Grab the invoice PDF from that email and save it."*
 ```bash
 adom-google gmail attachments <messageId>                 # list parts
 adom-google gmail read <messageId> <attId> -o invoice.pdf
 ```
 
-**👤 Contacts** — *"Save this new fab vendor; put the portal login in the notes."*
+**Contacts** — *"Save this new fab vendor; put the portal login in the notes."*
 ```bash
 adom-google contacts create --name "Jane Fab" --org "Fab Co" --notes "portal login in 1Password"
 ```
 
-**📅 Calendar** — *"Put a Rev C bring-up on my calendar Tuesday 2pm and invite the team."*
+**Calendar** — *"Put a Rev C bring-up on my calendar Tuesday 2pm and invite the team."*
 ```bash
 adom-google api -X POST "https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=all" \
   -d '{"summary":"Rev C bring-up","start":{"dateTime":"2026-06-23T14:00:00","timeZone":"America/Chicago"},
@@ -224,16 +224,16 @@ adom-google api -X POST "https://www.googleapis.com/calendar/v3/calendars/primar
        "attendees":[{"email":"team@yourco.com"}]}'
 ```
 
-**✅ Tasks** — *"Add 'order solder stencil' to my list."*
+**Tasks** — *"Add 'order solder stencil' to my list."*
 ```bash
 adom-google api -X POST "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks" \
   -d '{"title":"Order solder stencil"}'
 ```
 
-**💬 Chat** — *"Message Colby that the boards shipped."* — posts as **you** (no webhook prefix):
+**Chat** — *"Message Colby that the boards shipped."* — posts as **you** (no webhook prefix):
 ```bash
 adom-google chat spaces                       # find your spaces / space ids
-adom-google chat send --to colby@adom.inc "Rev C boards shipped 🚀"   # email auto-resolves the DM
+adom-google chat send --to colby@adom.inc "Rev C boards shipped"   # email auto-resolves the DM
 adom-google chat send --to spaces/AAQAxxxx "Standup in 5"            # or a space id
 adom-google chat send --to spaces/AAQAxxxx @release-notes.md          # @file / '-' = stdin
 adom-google chat read --from colby@adom.inc --limit 10               # recent messages
@@ -243,33 +243,33 @@ adom-google chat read --from colby@adom.inc --limit 10               # recent me
 > Google identity (clean, no prefix). For an **attributed bot post** to a team space
 > (deploys/alerts as *"Kel (on behalf of …)"*), use
 > **[adom-gchat](https://wiki.adom.inc/adom/adom-gchat)** — the post-only webhook bot. Two
-> tools, one boundary: yourself ⇒ adom-google, the bot ⇒ adom-gchat.
+> tools, one boundary: post as yourself with adom-google, the attributed bot with adom-gchat.
 
-**📁 Drive** — *"Find every Gerber zip, then upload my new one."*
+**Drive** — *"Find every Gerber zip, then upload my new one."*
 ```bash
 adom-google api "https://www.googleapis.com/drive/v3/files" -q q="name contains 'gerber'"
 adom-google api -X POST "https://www.googleapis.com/upload/drive/v3/files?uploadType=media" \
   --upload-file rev-c-gerbers.zip --content-type application/zip
 ```
 
-**📊 Sheets** — *"Make a Rev C BOM and drop in the first rows."*
+**Sheets** — *"Make a Rev C BOM and drop in the first rows."*
 ```bash
 adom-google api -X POST "https://sheets.googleapis.com/v4/spreadsheets" -d '{"properties":{"title":"Rev C BOM"}}'
 adom-google api -X PUT "https://sheets.googleapis.com/v4/spreadsheets/<id>/values/A1?valueInputOption=RAW" \
   -d '{"values":[["Ref","Part","Qty"],["C1","100nF 0402","12"]]}'
 ```
 
-**📝 Docs** — *"Start a bring-up checklist doc."*
+**Docs** — *"Start a bring-up checklist doc."*
 ```bash
 adom-google api -X POST "https://docs.googleapis.com/v1/documents" -d '{"title":"Rev C bring-up checklist"}'
 ```
 
-**📽 Slides** — *"Spin up a board-review deck."*
+**Slides** — *"Spin up a board-review deck."*
 ```bash
 adom-google api -X POST "https://slides.googleapis.com/v1/presentations" -d '{"title":"Rev C board review"}'
 ```
 
-**▶ YouTube** — *"Upload the 3D walkthrough of my latest circuit board as unlisted."* 🎬
+**YouTube** — *"Upload the 3D walkthrough of my latest circuit board as unlisted."*
 ```bash
 # 1) start a resumable upload with the metadata — returns an upload URL in the Location header
 adom-google api -X POST \
@@ -347,13 +347,13 @@ do whatever you want with the code. The whole reason it lives on the wiki is so 
 improves it *together*:
 
 1. **Fork & hack to your heart's content.** Every wiki page is a real git repo (see the **Files**
-   tab), and `adompkg install adom-google` drops the full source on your machine. Add a
+   tab), and `adom-wiki pkg install adom/adom-google` drops the full source on your machine. Add a
    subcommand, wire up another Google API, fix a bug, change anything you like.
 2. **Publish your changes back so everyone benefits.** Bump the version in `package.json`, then:
    ```bash
-   adompkg publish        # builds a tarball + pushes it to the wiki page
+   adom-wiki pkg publish --org <you>        # builds a tarball + pushes it to the wiki page
    ```
-   Your improvement is instantly live for the **entire community** to `adompkg install`. That's
+   Your improvement is instantly live for the **entire community** to `adom-wiki pkg install`. That's
    the model — everyone pulls from, and pushes to, the same page. Send a fix, ship a feature,
    and every other user (and every Adom employee) picks it up.
 
