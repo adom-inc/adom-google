@@ -1,6 +1,6 @@
 {
   "slug": "adom-google",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "type": "app",
   "license": "MIT",
   "description": "Drive your whole Google Workspace from the terminal — Gmail, Contacts, Drive, Sheets, Docs, Slides, Calendar, Tasks, Google Chat, plus a generic `api` passthrough to hit ANY Google API. Open source, ships with NO OAuth provider baked in: point it at your own token-broker gateway (`provider set`), buy a managed one, or — Adom staff — install the private adom-google-adom provider. One-click OAuth, no client secret on your machine. First run asks safe mode (no delete) vs full mode (incl. delete).",
@@ -29,6 +29,38 @@
   "install": {
     "binary_name": "adom-google"
   },
+  "hero": {
+    "path": "docs/hero.png"
+  },
+  "discovery_pitch": "Drive your whole Google Workspace from the terminal through your AI — read Gmail (and its attachments), search Drive, build Sheets/Docs/Slides, manage Calendar & Tasks, and post to Google Chat as yourself. One OAuth, any Google API.",
+  "discovery_triggers": [
+    "read my gmail",
+    "read my email",
+    "read my emails",
+    "read my gmails",
+    "check my email",
+    "check my gmail",
+    "read an email attachment",
+    "gmail attachment",
+    "search my google drive",
+    "find a file in my drive",
+    "upload to google drive",
+    "make a google sheet",
+    "update a google sheet",
+    "write a google doc",
+    "compose a google doc",
+    "build a google slides deck",
+    "make a slide deck",
+    "create a calendar event",
+    "add to my calendar",
+    "post to google chat",
+    "message my team on google chat",
+    "google workspace",
+    "google contacts",
+    "set up google workspace",
+    "connect my google account",
+    "adom-google"
+  ],
   "dependencies": {},
   "scripts": {
     "install": "./install.sh",
