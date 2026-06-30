@@ -1,6 +1,6 @@
 {
   "slug": "adom-google",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "type": "app",
   "license": "MIT",
   "description": "Drive your whole Google Workspace from the terminal — Gmail, Contacts, Drive, Sheets, Docs, Slides, Calendar, Tasks, Google Chat, plus a generic `api` passthrough to hit ANY Google API. Open source, ships with NO OAuth provider baked in: point it at your own token-broker gateway (`provider set`), buy a managed one, or — Adom staff — install the private adom-google-adom provider. One-click OAuth, no client secret on your machine. First run asks safe mode (no delete) vs full mode (incl. delete).",
@@ -86,5 +86,13 @@
     "install.sh",
     "uninstall.sh",
     "package.json"
+  ],
+  "sample_prompts": [
+    "read my gmail and summarize anything urgent",
+    "save the invoice PDF from that email to a file",
+    "search my Google Drive for the latest quote",
+    "make a Google Sheet of this BOM",
+    "build a Google Slides deck for the board review",
+    "post to Google Chat that the boards shipped"
   ]
 }
